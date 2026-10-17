@@ -1,0 +1,27 @@
+{
+  "name": "y",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Y — clone de TikTok (marque Y) : feed vidéo vertical, interactions, live, DM, marketplace",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,client -c magenta,cyan \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "npm --workspace=server run dev",
+    "dev:client": "npm --workspace=client run dev",
+    "build": "npm --workspace=server run build && npm --workspace=client run build",
+    "start": "npm --workspace=server run start",
+    "seed": "npm --workspace=server run seed",
+    "smoke": "npm --workspace=server run smoke",
+    "typecheck": "npm --workspace=server run typecheck && npm --workspace=client run typecheck"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
