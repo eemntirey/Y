@@ -9,14 +9,8 @@ const PORT = process.env.SMOKE_PORT ?? '4123';
 const BASE = `http://127.0.0.1:${PORT}/api`;
 const dataDir = mkdtempSync(join(tmpdir(), 'y-smoke-'));
 
-const server = spawn(process.execPath, ['node_modules/tsx/dist/cli.mjs', 'src/index.ts'], {
-  cwd: process.cwd(),
-  env: { ...process.env, Y_PORT: PORT, Y_DATA_DIR: dataDir, Y_SECRET: 'smoke-secret' },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
+let server: ReturnType<typeof spawn> | undefined;
 let serverLog = '';
-server.stdout.on('data', (d) => (serverLog += d));
-server.stderr.on('data', (d) => (serverLog += d));
 
 let failures = 0;
 const check = (label: string, condition: boolean, extra = '') => {
@@ -90,6 +84,15 @@ const main = async () => {
     console.error('seed en echec\n', seed.stdout, seed.stderr);
     process.exit(1);
   }
+
+  // Seed must finish and release SQLite before the API opens the same database.
+  server = spawn(process.execPath, ['node_modules/tsx/dist/cli.mjs', 'src/index.ts'], {
+    cwd: process.cwd(),
+    env: { ...process.env, Y_PORT: PORT, Y_DATA_DIR: dataDir, Y_SECRET: 'smoke-secret' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  server.stdout?.on('data', (d) => (serverLog += d));
+  server.stderr?.on('data', (d) => (serverLog += d));
 
   const up = await waitForServer();
   if (!up) {
@@ -341,7 +344,7 @@ const main = async () => {
 
   console.log(`\n${failures === 0 ? 'TOUT PASSE' : `${failures} ECHEC(S)`}`);
   if (failures > 0 && serverLog) console.log('\n--- log serveur ---\n' + serverLog);
-  server.kill();
+  server?.kill();
   await new Promise((r) => setTimeout(r, 400));
   try {
     rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
