@@ -1,8 +1,8 @@
 import { Router } from 'express';
 import { createHash } from 'node:crypto';
-import { get, run, uid, now } from '../db/index.js';
+import { get, run, uid, now, tx } from '../db/index.js';
 import {
-  consumeSession,
+  rotateSession,
   createSession,
   hashPassword,
   passwordProblem,
@@ -52,9 +52,13 @@ authRouter.post(
         ts,
       ],
     );
-    const refresh = createSession(id, req.get('user-agent') ?? undefined);
+    const session = createSession(id, req.get('user-agent') ?? undefined);
     const user = loadUserByUsername(username)!;
-    res.status(201).json({ user: serializeUser(user, id), token: signAccessToken(id, username), refresh });
+    res.status(201).json({
+      user: serializeUser(user, id),
+      token: signAccessToken(id, username, session.sessionId),
+      refresh: session.refresh,
+    });
   }),
 );
 
@@ -74,11 +78,11 @@ authRouter.post(
     if (!row || !(await verifyPassword(password, row.password_hash)))
       throw unauthorized('Identifiants incorrects');
 
-    const refresh = createSession(row.id, req.get('user-agent') ?? undefined);
+    const session = createSession(row.id, req.get('user-agent') ?? undefined);
     res.json({
       user: serializeUser(loadUserByUsername(row.username)!, row.id),
-      token: signAccessToken(row.id, row.username),
-      refresh,
+      token: signAccessToken(row.id, row.username, session.sessionId),
+      refresh: session.refresh,
     });
   }),
 );
@@ -87,12 +91,12 @@ authRouter.post(
   '/refresh',
   wrap(async (req, res) => {
     const refresh = String(req.body?.refresh ?? '');
-    const session = refresh ? consumeSession(refresh) : null;
+    const session = refresh ? rotateSession(refresh, req.get('user-agent') ?? undefined) : null;
     if (!session) throw unauthorized('Session expirée');
     res.json({
       user: serializeUser(loadUserByUsername(session.username)!, session.userId),
-      token: signAccessToken(session.userId, session.username),
-      refresh: createSession(session.userId, req.get('user-agent') ?? undefined),
+      token: signAccessToken(session.userId, session.username, session.sessionId),
+      refresh: session.refresh,
     });
   }),
 );
@@ -158,12 +162,21 @@ authRouter.post(
       throw bad('Mot de passe actuel incorrect');
     const pErr = passwordProblem(next);
     if (pErr) throw bad(pErr);
-    run('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?', [
-      await hashPassword(next),
-      now(),
-      req.userId,
-    ]);
-    run('DELETE FROM sessions WHERE user_id = ?', [req.userId]);
-    res.json({ ok: true, token: signAccessToken(req.userId!, get<{ username: string }>('SELECT username FROM users WHERE id = ?', [req.userId])!.username), refresh: createSession(req.userId!) });
+    const passwordHash = await hashPassword(next);
+    const username = get<{ username: string }>('SELECT username FROM users WHERE id = ?', [req.userId])!.username;
+    const session = tx(() => {
+      run('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?', [
+        passwordHash,
+        now(),
+        req.userId,
+      ]);
+      run('DELETE FROM sessions WHERE user_id = ?', [req.userId]);
+      return createSession(req.userId!, req.get('user-agent') ?? undefined);
+    });
+    res.json({
+      ok: true,
+      token: signAccessToken(req.userId!, username, session.sessionId),
+      refresh: session.refresh,
+    });
   }),
 );
