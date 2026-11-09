@@ -11,9 +11,11 @@ interface Client {
 }
 
 const clients = new Set<Client>();
+let realtimeServer: WebSocketServer | null = null;
 
 export function attachRealtime(server: Server): void {
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024, perMessageDeflate: false });
+  realtimeServer = wss;
 
   wss.on('connection', (socket) => {
     let client: Client | null = null;
@@ -125,6 +127,13 @@ export function attachRealtime(server: Server): void {
 
   // exposé au module messages/live via global
   (globalThis as { __yBroadcastRoom?: (id: string, p: unknown) => void }).__yBroadcastRoom = broadcastRoom;
+}
+
+export function closeRealtime(): void {
+  for (const client of clients) client.socket.close(1001, 'server shutting down');
+  clients.clear();
+  realtimeServer?.close();
+  realtimeServer = null;
 }
 
 export function broadcastRoom(roomId: string, payload: unknown): void {
