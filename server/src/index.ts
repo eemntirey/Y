@@ -146,5 +146,5 @@ const shutdown = (signal: NodeJS.Signals): void => {
   });
 };
 
-process.once('SIGTERM', shutdown);
-process.once('SIGINT', shutdown);
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));
