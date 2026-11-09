@@ -217,14 +217,17 @@ const main = async () => {
     check('POST live join (spectateur)', joined.body?.room?.stats?.viewers >= 1);
     const liveMsg = await api(`/live/rooms/${roomId}/comments`, { method: 'POST', token, body: JSON.stringify({ body: 'Salut le live' }) });
     check('POST live comment', liveMsg.status === 201);
+    const walletBefore = await api('/auth/me', { token });
     const topup = await api('/live/wallet/topup', { method: 'POST', token, body: JSON.stringify({ amount: 500 }) });
-    check('POST wallet topup', topup.body?.coins > 0);
+    const walletAfter = await api('/auth/me', { token });
+    check('wallet topup sans fournisseur refusé (503)', topup.status === 503 && topup.body?.code === 'PAYMENT_PROVIDER_NOT_CONFIGURED');
+    check('wallet inchangé après tentative de recharge', walletBefore.body?.user?.coins === walletAfter.body?.user?.coins);
     const gift = await api(`/live/rooms/${roomId}/gifts`, {
       method: 'POST',
       token,
       body: JSON.stringify({ giftId: gifts.body.items[0].id }),
     });
-    check('POST live gift', gift.status === 201, gift.body?.error);
+    check('cadeau refusé si solde insuffisant (400)', gift.status === 400 && gift.body?.error === 'Solde de Y Coins insuffisant');
     const ended = await api(`/live/rooms/${roomId}/end`, { method: 'POST', token });
     check('POST live end', ended.status === 200);
 
@@ -237,16 +240,13 @@ const main = async () => {
     const cart = await api('/shop/cart', { token });
     check('GET /shop/cart + total', cart.body?.total === 2400, `total=${cart.body?.total}`);
     const order = await api('/shop/orders', { method: 'POST', token });
-    check('POST /shop/orders', order.status === 201 && order.body?.total === 2400, order.body?.error);
+    check('checkout sans fournisseur refusé (503)', order.status === 503 && order.body?.code === 'PAYMENT_PROVIDER_NOT_CONFIGURED');
     const orders = await api('/shop/orders', { token });
-    check('GET /shop/orders', orders.body?.items?.length === 1);
-
-    // stock restant : 5 - 2 = 3, on tente d'en acheter 5
-    await api('/shop/cart', { method: 'POST', token, body: JSON.stringify({ productId: product.body.product.id, quantity: 5 }) });
-    const oversell = await api('/shop/orders', { method: 'POST', token });
-    check('POST /shop/orders refuse le stock insuffisant (400)', oversell.status === 400, `status=${oversell.status} ${oversell.body?.error ?? ''}`);
-    const ordersAfter = await api('/shop/orders', { token });
-    check('commande surstock non persistée', ordersAfter.body?.items?.length === 1);
+    check('aucune commande fictive créée', orders.body?.items?.length === 0);
+    const cartAfter = await api('/shop/cart', { token });
+    check('panier conservé après refus du paiement', cartAfter.body?.total === 2400);
+    const productAfter = await api(`/shop/products/${product.body.product.id}`, { token });
+    check('stock inchangé sans paiement confirmé', productAfter.body?.product?.stock === 5);
 
     const report = await api('/discover/reports', {
       method: 'POST',
