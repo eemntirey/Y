@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { all, get, now, run, tx, uid } from '../db/index.js';
+import { all, get, now, run, uid } from '../db/index.js';
 import { bad, forbidden, int, notFound, requireAuth, str, wrap, type AuthedRequest } from '../lib/http.js';
 import { loadUser, serializeUser } from '../lib/serialize.js';
 
