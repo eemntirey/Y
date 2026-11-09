@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { createServer } from 'node:http';
 import { config } from './config.js';
-import { UPLOAD_DIR } from './db/index.js';
+import { db, UPLOAD_DIR } from './db/index.js';
 import { ApiError, optionalAuth, rateLimit } from './lib/http.js';
 import { authRouter } from './routes/auth.js';
 import { userRouter } from './routes/users.js';
@@ -12,7 +12,7 @@ import { discoverRouter, notificationRouter } from './routes/discover.js';
 import { messageRouter } from './routes/messages.js';
 import { liveRouter } from './routes/live.js';
 import { shopRouter } from './routes/shop.js';
-import { attachRealtime, seedGifts } from './realtime.js';
+import { attachRealtime, closeRealtime, seedGifts } from './realtime.js';
 
 seedGifts();
 
@@ -67,6 +67,17 @@ app.use(
 app.get('/api/health', (_req, res) => res.json({ ok: true, brand: config.brand, ts: Date.now() }));
 app.get('/health', (_req, res) => res.json({ ok: true, brand: config.brand, ts: Date.now() }));
 
+const readinessHandler: express.RequestHandler = (_req, res) => {
+  try {
+    db.prepare('SELECT 1').get();
+    res.json({ ok: true, checks: { database: 'ready' } });
+  } catch {
+    res.status(503).json({ ok: false, checks: { database: 'unavailable' } });
+  }
+};
+app.get('/api/ready', readinessHandler);
+app.get('/ready', readinessHandler);
+
 // Mount routes with both /api and root prefix
 const routePairs: [string, express.Router][] = [
   ['/auth', authRouter],
@@ -101,3 +112,39 @@ attachRealtime(server);
 server.listen(config.port, config.host, () => {
   console.log(`[${config.brand}] API -> http://localhost:${config.port}`);
 });
+
+let shuttingDown = false;
+const shutdown = (signal: NodeJS.Signals): void => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[${config.brand}] arrêt demandé (${signal})`);
+
+  closeRealtime();
+  const forceTimer = setTimeout(() => {
+    server.closeAllConnections();
+    try {
+      db.close();
+    } catch {
+      // The database may already have been closed by the normal shutdown path.
+    }
+    process.exit(1);
+  }, 10_000);
+  forceTimer.unref();
+
+  server.close((err) => {
+    clearTimeout(forceTimer);
+    try {
+      db.close();
+    } catch (closeError) {
+      console.error('[y] fermeture SQLite impossible', closeError);
+      process.exitCode = 1;
+    }
+    if (err) {
+      console.error('[y] fermeture HTTP impossible', err);
+      process.exitCode = 1;
+    }
+  });
+};
+
+process.once('SIGTERM', shutdown);
+process.once('SIGINT', shutdown);
