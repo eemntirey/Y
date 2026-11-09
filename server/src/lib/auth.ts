@@ -7,7 +7,7 @@ import {
 } from 'node:crypto';
 import { promisify } from 'node:util';
 import { config } from '../config.js';
-import { get, run, uid, now } from '../db/index.js';
+import { get, run, uid, now, tx } from '../db/index.js';
 
 const scrypt = promisify(scryptCb) as (
   password: string,
@@ -37,16 +37,23 @@ const b64uDecode = (input: string) => Buffer.from(input.replace(/-/g, '+').repla
 export interface TokenPayload {
   sub: string;
   username: string;
+  sid: string;
   iat: number;
   exp: number;
 }
 
-export function signAccessToken(userId: string, username: string): string {
+export interface SessionCredentials {
+  refresh: string;
+  sessionId: string;
+}
+
+export function signAccessToken(userId: string, username: string, sessionId: string): string {
   const header = b64u(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
   const payload = b64u(
     JSON.stringify({
       sub: userId,
       username,
+      sid: sessionId,
       iat: Math.floor(Date.now() / 1000),
       exp: Math.floor(Date.now() / 1000) + config.jwtTtl,
     }),
@@ -64,7 +71,20 @@ export function verifyAccessToken(token: string): TokenPayload | null {
   if (!timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
   try {
     const parsed = JSON.parse(b64uDecode(payload).toString('utf8')) as TokenPayload;
-    if (typeof parsed.exp !== 'number' || parsed.exp * 1000 < Date.now()) return null;
+    if (
+      typeof parsed.sub !== 'string' ||
+      typeof parsed.sid !== 'string' ||
+      typeof parsed.exp !== 'number' ||
+      parsed.exp * 1000 < Date.now()
+    ) return null;
+
+    // Access tokens are bound to a persisted refresh session. Deleting/rotating
+    // that session immediately revokes every access token issued for it.
+    const session = get<{ expires_at: string }>(
+      'SELECT expires_at FROM sessions WHERE id = ? AND user_id = ?',
+      [parsed.sid, parsed.sub],
+    );
+    if (!session || new Date(session.expires_at).getTime() < Date.now()) return null;
     return parsed;
   } catch {
     return null;
@@ -73,12 +93,13 @@ export function verifyAccessToken(token: string): TokenPayload | null {
 
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
 
-export function createSession(userId: string, userAgent?: string): string {
+export function createSession(userId: string, userAgent?: string): SessionCredentials {
   const refresh = randomBytes(32).toString('base64url');
+  const sessionId = uid();
   run(
     'INSERT INTO sessions (id, user_id, token_hash, user_agent, expires_at, created_at) VALUES (?,?,?,?,?,?)',
     [
-      uid(),
+      sessionId,
       userId,
       sha256(refresh),
       userAgent ?? null,
@@ -86,18 +107,30 @@ export function createSession(userId: string, userAgent?: string): string {
       now(),
     ],
   );
-  return refresh;
+  return { refresh, sessionId };
 }
 
-export function consumeSession(refresh: string): { userId: string; username: string } | null {
-  const row = get<{ id: string; user_id: string; expires_at: string }>(
-    'SELECT id, user_id, expires_at FROM sessions WHERE token_hash = ?',
-    [sha256(refresh)],
-  );
-  if (!row || new Date(row.expires_at).getTime() < Date.now()) return null;
-  run('DELETE FROM sessions WHERE id = ?', [row.id]);
-  const user = get<{ username: string }>('SELECT username FROM users WHERE id = ?', [row.user_id]);
-  return user ? { userId: row.user_id, username: user.username } : null;
+/** Atomically consumes the old refresh token and creates its replacement. */
+export function rotateSession(
+  refresh: string,
+  userAgent?: string,
+): ({ userId: string; username: string } & SessionCredentials) | null {
+  return tx(() => {
+    const row = get<{ id: string; user_id: string; expires_at: string }>(
+      'SELECT id, user_id, expires_at FROM sessions WHERE token_hash = ?',
+      [sha256(refresh)],
+    );
+    if (!row) return null;
+
+    run('DELETE FROM sessions WHERE id = ?', [row.id]);
+    if (new Date(row.expires_at).getTime() < Date.now()) return null;
+
+    const user = get<{ username: string }>('SELECT username FROM users WHERE id = ?', [row.user_id]);
+    if (!user) return null;
+
+    const next = createSession(row.user_id, userAgent);
+    return { userId: row.user_id, username: user.username, ...next };
+  });
 }
 
 export const passwordProblem = (password: string): string | null => {
