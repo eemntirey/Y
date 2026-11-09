@@ -40,7 +40,10 @@ app.use(
     origin: (origin, cb) => {
       if (!origin) return cb(null, true);
       if (config.corsOrigins.includes(origin)) return cb(null, true);
-      if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return cb(null, true);
+      if (
+        process.env.NODE_ENV !== 'production' &&
+        /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
+      ) return cb(null, true);
       cb(new Error('Origine non autorisée par CORS'));
     },
     credentials: true,
