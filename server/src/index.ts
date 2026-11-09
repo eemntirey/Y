@@ -2,8 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import { createServer } from 'node:http';
 import { config } from './config.js';
-import { UPLOAD_DIR } from './db/index.js';
-import { ApiError, optionalAuth } from './lib/http.js';
+import { db, UPLOAD_DIR } from './db/index.js';
+import { ApiError, optionalAuth, rateLimit } from './lib/http.js';
 import { authRouter } from './routes/auth.js';
 import { userRouter } from './routes/users.js';
 import { videoRouter } from './routes/videos.js';
@@ -12,26 +12,49 @@ import { discoverRouter, notificationRouter } from './routes/discover.js';
 import { messageRouter } from './routes/messages.js';
 import { liveRouter } from './routes/live.js';
 import { shopRouter } from './routes/shop.js';
-import { attachRealtime, seedGifts } from './realtime.js';
+import { attachRealtime, closeRealtime, seedGifts } from './realtime.js';
 
 seedGifts();
 
 const app = express();
+app.disable('x-powered-by');
+
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; " +
+      "script-src 'self'; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; " +
+      "media-src 'self' blob: https:; font-src 'self' data: https:; connect-src 'self' ws: wss: https:",
+  );
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
 
 app.use(
   cors({
     origin: (origin, cb) => {
       if (!origin) return cb(null, true);
       if (config.corsOrigins.includes(origin)) return cb(null, true);
-      if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return cb(null, true);
+      if (
+        process.env.NODE_ENV !== 'production' &&
+        /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
+      ) return cb(null, true);
       cb(new Error('Origine non autorisée par CORS'));
     },
     credentials: true,
   }),
 );
 app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: '64kb' }));
 app.use(optionalAuth);
+
+// Global per-process IP ceiling; shared storage is still required for multi-instance deployment.
+app.use(rateLimit({ windowMs: 60_000, max: 600 }));
 
 app.use(
   '/media',
@@ -43,6 +66,17 @@ app.use(
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, brand: config.brand, ts: Date.now() }));
 app.get('/health', (_req, res) => res.json({ ok: true, brand: config.brand, ts: Date.now() }));
+
+const readinessHandler: express.RequestHandler = (_req, res) => {
+  try {
+    db.prepare('SELECT 1').get();
+    res.json({ ok: true, checks: { database: 'ready' } });
+  } catch {
+    res.status(503).json({ ok: false, checks: { database: 'unavailable' } });
+  }
+};
+app.get('/api/ready', readinessHandler);
+app.get('/ready', readinessHandler);
 
 // Mount routes with both /api and root prefix
 const routePairs: [string, express.Router][] = [
@@ -78,3 +112,39 @@ attachRealtime(server);
 server.listen(config.port, config.host, () => {
   console.log(`[${config.brand}] API -> http://localhost:${config.port}`);
 });
+
+let shuttingDown = false;
+const shutdown = (signal: NodeJS.Signals): void => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[${config.brand}] arrêt demandé (${signal})`);
+
+  closeRealtime();
+  const forceTimer = setTimeout(() => {
+    server.closeAllConnections();
+    try {
+      db.close();
+    } catch {
+      // The database may already have been closed by the normal shutdown path.
+    }
+    process.exit(1);
+  }, 10_000);
+  forceTimer.unref();
+
+  server.close((err) => {
+    clearTimeout(forceTimer);
+    try {
+      db.close();
+    } catch (closeError) {
+      console.error('[y] fermeture SQLite impossible', closeError);
+      process.exitCode = 1;
+    }
+    if (err) {
+      console.error('[y] fermeture HTTP impossible', err);
+      process.exitCode = 1;
+    }
+  });
+};
+
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));

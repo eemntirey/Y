@@ -1,5 +1,6 @@
 // Smoke test API : démarre le serveur, exerce les routes, l'arrête.
 import { spawn, spawnSync } from 'node:child_process';
+import WebSocket from 'ws';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,14 +9,8 @@ const PORT = process.env.SMOKE_PORT ?? '4123';
 const BASE = `http://127.0.0.1:${PORT}/api`;
 const dataDir = mkdtempSync(join(tmpdir(), 'y-smoke-'));
 
-const server = spawn(process.execPath, ['node_modules/tsx/dist/cli.mjs', 'src/index.ts'], {
-  cwd: process.cwd(),
-  env: { ...process.env, Y_PORT: PORT, Y_DATA_DIR: dataDir, Y_SECRET: 'smoke-secret' },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
+let server: ReturnType<typeof spawn> | undefined;
 let serverLog = '';
-server.stdout.on('data', (d) => (serverLog += d));
-server.stderr.on('data', (d) => (serverLog += d));
 
 let failures = 0;
 const check = (label: string, condition: boolean, extra = '') => {
@@ -38,6 +33,31 @@ const api = async (path: string, init: RequestInit & { token?: string } = {}) =>
   }
   return { status: res.status, body: json };
 };
+
+const waitForWsMessage = (
+  socket: WebSocket,
+  predicate: (payload: any) => boolean,
+  timeoutMs = 3000,
+): Promise<any | null> =>
+  new Promise((resolve) => {
+    const onMessage = (raw: WebSocket.RawData) => {
+      try {
+        const payload = JSON.parse(raw.toString());
+        if (predicate(payload)) {
+          clearTimeout(timer);
+          socket.off('message', onMessage);
+          resolve(payload);
+        }
+      } catch {
+        // Ignore malformed frames in the smoke helper.
+      }
+    };
+    const timer = setTimeout(() => {
+      socket.off('message', onMessage);
+      resolve(null);
+    }, timeoutMs);
+    socket.on('message', onMessage);
+  });
 
 const waitForServer = async () => {
   for (let i = 0; i < 60; i++) {
@@ -65,6 +85,15 @@ const main = async () => {
     process.exit(1);
   }
 
+  // Seed must finish and release SQLite before the API opens the same database.
+  server = spawn(process.execPath, ['node_modules/tsx/dist/cli.mjs', 'src/index.ts'], {
+    cwd: process.cwd(),
+    env: { ...process.env, Y_PORT: PORT, Y_DATA_DIR: dataDir, Y_SECRET: 'smoke-secret' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  server.stdout?.on('data', (d) => (serverLog += d));
+  server.stderr?.on('data', (d) => (serverLog += d));
+
   const up = await waitForServer();
   if (!up) {
     console.error('serveur injoignable\n', serverLog);
@@ -74,6 +103,8 @@ const main = async () => {
 
     const health = await api('/health');
     check('GET /health', health.body?.ok === true && health.body?.brand === 'Y');
+    const readiness = await api('/ready');
+    check('GET /ready vérifie SQLite', readiness.status === 200 && readiness.body?.checks?.database === 'ready');
 
     const bad = await api('/auth/register', { method: 'POST', body: JSON.stringify({ username: 'A', email: 'x', password: '1' }) });
     check('validation inscription (400)', bad.status === 400, bad.body?.error);
@@ -84,8 +115,8 @@ const main = async () => {
       body: JSON.stringify({ username: `smoke${Date.now() % 100000}`, email, password: 'yolove2026', displayName: 'Test' }),
     });
     check('POST /auth/register (201)', reg.status === 201 && !!reg.body.token, reg.body?.error);
-    const token = reg.body.token;
-    const refresh = reg.body.refresh;
+    let token = reg.body.token;
+    let refresh = reg.body.refresh;
     const me = reg.body.user;
 
     const dup = await api('/auth/register', { method: 'POST', body: JSON.stringify({ username: me.username, email, password: 'yolove2026' }) });
@@ -112,6 +143,14 @@ const main = async () => {
 
     const refreshed = await api('/auth/refresh', { method: 'POST', body: JSON.stringify({ refresh }) });
     check('POST /auth/refresh', refreshed.status === 200 && !!refreshed.body.token);
+    if (refreshed.status === 200) {
+      token = refreshed.body.token;
+      refresh = refreshed.body.refresh;
+    }
+    const oldAccess = await api('/auth/me', { token: reg.body.token });
+    check('ancien access token révoqué après rotation (401)', oldAccess.status === 401);
+    const oldRefresh = await api('/auth/refresh', { method: 'POST', body: JSON.stringify({ refresh: reg.body.refresh }) });
+    check('ancien refresh token inutilisable après rotation (401)', oldRefresh.status === 401);
 
     const profile = await api(`/auth/me`, { token });
     check('GET /auth/me', profile.body?.user?.id === me.id);
@@ -215,16 +254,46 @@ const main = async () => {
     check('GET /live/gifts', Array.isArray(gifts.body?.items) && gifts.body.items.length > 0);
     const joined = await api(`/live/rooms/${roomId}/join`, { method: 'POST', token });
     check('POST live join (spectateur)', joined.body?.room?.stats?.viewers >= 1);
+
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
+    const readyPromise = waitForWsMessage(ws, (payload) => payload.type === 'ready');
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', () => {
+        ws.send(JSON.stringify({ type: 'auth', token }));
+        resolve();
+      });
+      ws.once('error', reject);
+    });
+    const wsReady = await readyPromise;
+    check('WebSocket authentifié par première trame (sans token URL)', !!wsReady);
+    if (wsReady) {
+      const deniedPromise = waitForWsMessage(ws, (payload) => payload.code === 'ROOM_ACCESS_DENIED');
+      ws.send(JSON.stringify({ type: 'subscribe', roomId: 'room-not-authorized' }));
+      const denied = await deniedPromise;
+      check('WebSocket refuse un salon non autorisé', !!denied);
+
+      const subscribedPromise = waitForWsMessage(
+        ws,
+        (payload) => payload.type === 'subscribed' && payload.roomId === roomId,
+      );
+      ws.send(JSON.stringify({ type: 'subscribe', roomId }));
+      const subscribed = await subscribedPromise;
+      check('WebSocket autorise un live existant', !!subscribed);
+    }
+    ws.close();
     const liveMsg = await api(`/live/rooms/${roomId}/comments`, { method: 'POST', token, body: JSON.stringify({ body: 'Salut le live' }) });
     check('POST live comment', liveMsg.status === 201);
+    const walletBefore = await api('/auth/me', { token });
     const topup = await api('/live/wallet/topup', { method: 'POST', token, body: JSON.stringify({ amount: 500 }) });
-    check('POST wallet topup', topup.body?.coins > 0);
+    const walletAfter = await api('/auth/me', { token });
+    check('wallet topup sans fournisseur refusé (503)', topup.status === 503 && topup.body?.code === 'PAYMENT_PROVIDER_NOT_CONFIGURED');
+    check('wallet inchangé après tentative de recharge', walletBefore.body?.user?.coins === walletAfter.body?.user?.coins);
     const gift = await api(`/live/rooms/${roomId}/gifts`, {
       method: 'POST',
       token,
       body: JSON.stringify({ giftId: gifts.body.items[0].id }),
     });
-    check('POST live gift', gift.status === 201, gift.body?.error);
+    check('cadeau refusé si solde insuffisant (400)', gift.status === 400 && gift.body?.error === 'Solde de Y Coins insuffisant');
     const ended = await api(`/live/rooms/${roomId}/end`, { method: 'POST', token });
     check('POST live end', ended.status === 200);
 
@@ -237,16 +306,13 @@ const main = async () => {
     const cart = await api('/shop/cart', { token });
     check('GET /shop/cart + total', cart.body?.total === 2400, `total=${cart.body?.total}`);
     const order = await api('/shop/orders', { method: 'POST', token });
-    check('POST /shop/orders', order.status === 201 && order.body?.total === 2400, order.body?.error);
+    check('checkout sans fournisseur refusé (503)', order.status === 503 && order.body?.code === 'PAYMENT_PROVIDER_NOT_CONFIGURED');
     const orders = await api('/shop/orders', { token });
-    check('GET /shop/orders', orders.body?.items?.length === 1);
-
-    // stock restant : 5 - 2 = 3, on tente d'en acheter 5
-    await api('/shop/cart', { method: 'POST', token, body: JSON.stringify({ productId: product.body.product.id, quantity: 5 }) });
-    const oversell = await api('/shop/orders', { method: 'POST', token });
-    check('POST /shop/orders refuse le stock insuffisant (400)', oversell.status === 400, `status=${oversell.status} ${oversell.body?.error ?? ''}`);
-    const ordersAfter = await api('/shop/orders', { token });
-    check('commande surstock non persistée', ordersAfter.body?.items?.length === 1);
+    check('aucune commande fictive créée', orders.body?.items?.length === 0);
+    const cartAfter = await api('/shop/cart', { token });
+    check('panier conservé après refus du paiement', cartAfter.body?.total === 2400);
+    const productAfter = await api(`/shop/products/${product.body.product.id}`, { token });
+    check('stock inchangé sans paiement confirmé', productAfter.body?.product?.stock === 5);
 
     const report = await api('/discover/reports', {
       method: 'POST',
@@ -258,14 +324,43 @@ const main = async () => {
     const badUpload = await api('/videos', { method: 'POST', token, body: JSON.stringify({ description: 'sans fichier' }) });
     check('upload sans fichier refuse (400)', badUpload.status === 400);
 
+    const fakeVideo = new FormData();
+    fakeVideo.append('video', new Blob(['not a real video'], { type: 'video/mp4' }), 'fake.mp4');
+    const fakeVideoResponse = await fetch(`${BASE}/videos`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: fakeVideo,
+    });
+    check('signature vidéo falsifiée refusée (415)', fakeVideoResponse.status === 415);
+
     const notFound = await api('/route/inexistante');
     check('404 JSON', notFound.status === 404 && notFound.body?.error === 'Route inconnue');
+
+    const logout = await api('/auth/logout', { method: 'POST', body: JSON.stringify({ refresh }) });
+    check('POST /auth/logout', logout.status === 200);
+    const revokedAccess = await api('/auth/me', { token });
+    check('access token révoqué après logout (401)', revokedAccess.status === 401);
+    const replayRefresh = await api('/auth/refresh', { method: 'POST', body: JSON.stringify({ refresh }) });
+    check('refresh token inutilisable après logout (401)', replayRefresh.status === 401);
   }
+
+  let shutdownClean = false;
+  if (server && server.exitCode === null) {
+    const exited = new Promise<boolean>((resolve) => {
+      server!.once('exit', (code) => resolve(code === 0));
+    });
+    server.kill('SIGTERM');
+    shutdownClean = await Promise.race([
+      exited,
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 3000)),
+    ]);
+  } else {
+    shutdownClean = server?.exitCode === 0;
+  }
+  check('arrêt propre sur SIGTERM', shutdownClean);
 
   console.log(`\n${failures === 0 ? 'TOUT PASSE' : `${failures} ECHEC(S)`}`);
   if (failures > 0 && serverLog) console.log('\n--- log serveur ---\n' + serverLog);
-  server.kill();
-  await new Promise((r) => setTimeout(r, 400));
   try {
     rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   } catch {

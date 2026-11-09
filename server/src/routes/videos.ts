@@ -1,7 +1,7 @@
-import { Router } from 'express';
+import { Router, type RequestHandler } from 'express';
 import multer from 'multer';
 import { extname, join } from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readSync, unlinkSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { UPLOAD_DIR, all, bumpUserCounts, get, now, run, syncHashtags, tx, uid } from '../db/index.js';
 import { config } from '../config.js';
@@ -26,9 +26,49 @@ const upload = multer({
   limits: { fileSize: config.maxUploadMb * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (file.mimetype.startsWith('video/')) return cb(null, true);
-    cb(new Error('Seules les vidéos sont acceptées'));
+    cb(null, false);
   },
 });
+
+const validateVideoSignature: RequestHandler = (req, res, next) => {
+  const file = req.file;
+  if (!file) return next();
+
+  let fd: number | undefined;
+  try {
+    fd = openSync(file.path, 'r');
+    const header = Buffer.alloc(16);
+    const bytesRead = readSync(fd, header, 0, header.length, 0);
+    closeSync(fd);
+    fd = undefined;
+
+    const signature = header.subarray(0, bytesRead);
+    const isMp4OrQuickTime = bytesRead >= 12 && signature.toString('ascii', 4, 8) === 'ftyp';
+    const isWebM = bytesRead >= 4 && signature.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+    const isAvi = bytesRead >= 12 && signature.toString('ascii', 0, 4) === 'RIFF' && signature.toString('ascii', 8, 12) === 'AVI ';
+    const isMpegProgramStream =
+      bytesRead >= 4 &&
+      signature[0] === 0x00 &&
+      signature[1] === 0x00 &&
+      signature[2] === 0x01 &&
+      (signature[3] === 0xba || signature[3] === 0xb3);
+
+    if (!isMp4OrQuickTime && !isWebM && !isAvi && !isMpegProgramStream) {
+      unlinkSync(file.path);
+      res.status(415).json({ error: 'Signature de fichier vidéo non reconnue' });
+      return;
+    }
+    next();
+  } catch (err) {
+    if (fd !== undefined) closeSync(fd);
+    try {
+      unlinkSync(file.path);
+    } catch {
+      // Le fichier peut déjà avoir été supprimé.
+    }
+    next(err);
+  }
+};
 
 const FEED_COLUMNS = `v.* FROM videos v
   JOIN users u ON u.id = v.user_id
@@ -110,6 +150,7 @@ videoRouter.post(
   '/',
   requireAuth,
   upload.single('video'),
+  validateVideoSignature,
   wrap((req: AuthedRequest, res) => {
     const file = req.file;
     if (!file) throw bad('Aucun fichier vidéo reçu');

@@ -11,54 +11,104 @@ interface Client {
 }
 
 const clients = new Set<Client>();
+let realtimeServer: WebSocketServer | null = null;
 
 export function attachRealtime(server: Server): void {
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024, perMessageDeflate: false });
+  realtimeServer = wss;
 
-  wss.on('connection', (socket, req) => {
-    const url = new URL(req.url ?? '/ws', 'http://localhost');
-    const token = url.searchParams.get('token');
-    const payload = token ? verifyAccessToken(token) : null;
-    if (!payload) {
-      socket.close(4401, 'unauthorized');
-      return;
-    }
-
-    const client: Client = { socket, userId: payload.sub, rooms: new Set() };
-    clients.add(client);
+  wss.on('connection', (socket) => {
+    let client: Client | null = null;
+    let eventWindowStarted = Date.now();
+    let eventCount = 0;
+    const authTimeout = setTimeout(() => {
+      if (!client) socket.close(4401, 'authentication required');
+    }, 5000);
 
     const send = (data: unknown) => {
       if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(data));
     };
-    send({ type: 'ready', userId: client.userId });
 
     socket.on('message', (raw) => {
-      let msg: { type?: string; roomId?: string };
+      let msg: { type?: string; roomId?: string; token?: string };
       try {
         msg = JSON.parse(String(raw)) as typeof msg;
       } catch {
+        send({ type: 'error', code: 'INVALID_MESSAGE' });
         return;
       }
-      if (msg.type === 'subscribe' && msg.roomId) {
-        client.rooms.add(msg.roomId);
-        send({ type: 'subscribed', roomId: msg.roomId });
+
+      // Browser WebSocket APIs cannot set Authorization headers. Authenticate
+      // with the first frame instead of putting bearer credentials in the URL.
+      if (!client) {
+        if (msg.type !== 'auth' || typeof msg.token !== 'string') {
+          socket.close(4401, 'authentication required');
+          return;
+        }
+        const payload = verifyAccessToken(msg.token);
+        if (!payload) {
+          socket.close(4401, 'unauthorized');
+          return;
+        }
+        clearTimeout(authTimeout);
+        client = { socket, userId: payload.sub, rooms: new Set() };
+        clients.add(client);
+        send({ type: 'ready', userId: client.userId });
+        return;
       }
-      if (msg.type === 'unsubscribe' && msg.roomId) client.rooms.delete(msg.roomId);
+
+      const nowMs = Date.now();
+      if (nowMs - eventWindowStarted >= 10_000) {
+        eventWindowStarted = nowMs;
+        eventCount = 0;
+      }
+      eventCount += 1;
+      if (eventCount > 100) {
+        socket.close(4429, 'event rate limit exceeded');
+        return;
+      }
+
+      const roomId = typeof msg.roomId === 'string' ? msg.roomId.slice(0, 64) : '';
+      if (msg.type === 'subscribe' && roomId) {
+        const isLiveRoom = !!get(
+          "SELECT 1 FROM live_rooms WHERE id = ? AND status = 'live'",
+          [roomId],
+        );
+        const isConversationMember = !!get(
+          'SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?',
+          [roomId, client.userId],
+        );
+        if (!isLiveRoom && !isConversationMember) {
+          send({ type: 'error', code: 'ROOM_ACCESS_DENIED', roomId });
+          return;
+        }
+        client.rooms.add(roomId);
+        send({ type: 'subscribed', roomId });
+      }
+      if (msg.type === 'unsubscribe' && roomId) client.rooms.delete(roomId);
       if (msg.type === 'ping') send({ type: 'pong' });
-      if (msg.type === 'typing' && msg.roomId) {
-        broadcastRoom(msg.roomId, {
-          type: 'typing',
-          roomId: msg.roomId,
-          userId: client.userId,
-        });
+      if (msg.type === 'typing' && roomId && client.rooms.has(roomId)) {
+        const isConversationMember = !!get(
+          'SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?',
+          [roomId, client.userId],
+        );
+        if (isConversationMember) {
+          broadcastRoom(roomId, {
+            type: 'typing',
+            roomId,
+            userId: client.userId,
+          });
+        }
       }
     });
 
     socket.on('close', () => {
-      clients.delete(client);
+      clearTimeout(authTimeout);
+      if (client) clients.delete(client);
     });
     socket.on('error', () => {
-      clients.delete(client);
+      clearTimeout(authTimeout);
+      if (client) clients.delete(client);
     });
   });
 
@@ -77,6 +127,13 @@ export function attachRealtime(server: Server): void {
 
   // exposé au module messages/live via global
   (globalThis as { __yBroadcastRoom?: (id: string, p: unknown) => void }).__yBroadcastRoom = broadcastRoom;
+}
+
+export function closeRealtime(): void {
+  for (const client of clients) client.socket.close(1001, 'server shutting down');
+  clients.clear();
+  realtimeServer?.close();
+  realtimeServer = null;
 }
 
 export function broadcastRoom(roomId: string, payload: unknown): void {

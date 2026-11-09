@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { all, get, now, run, tx, uid } from '../db/index.js';
+import { all, get, now, run, uid } from '../db/index.js';
 import { bad, forbidden, int, notFound, requireAuth, str, wrap, type AuthedRequest } from '../lib/http.js';
 import { loadUser, serializeUser } from '../lib/serialize.js';
 
@@ -181,42 +181,13 @@ shopRouter.delete(
 shopRouter.post(
   '/orders',
   requireAuth,
-  wrap((req: AuthedRequest, res) => {
-    const items = all<ProductRow & { quantity: number }>(
-      `SELECT p.*, c.quantity FROM cart_items c JOIN products p ON p.id = c.product_id WHERE c.user_id = ?`,
-      [req.userId],
-    );
-    if (items.length === 0) throw bad('Panier vide');
-    const total = items.reduce((sum, r) => sum + r.price * r.quantity, 0);
-    const orderId = uid();
-
-    tx(() => {
-      run('INSERT INTO orders (id, buyer_id, total, status, created_at) VALUES (?,?,?,?,?)', [
-        orderId,
-        req.userId,
-        total,
-        'paid',
-        now(),
-      ]);
-      for (const item of items) {
-        run('INSERT INTO order_items (order_id, product_id, title, price, quantity) VALUES (?,?,?,?,?)', [
-          orderId,
-          item.id,
-          item.title,
-          item.price,
-          item.quantity,
-        ]);
-        const sold = run(
-          'UPDATE products SET stock = stock - ?, sales = sales + ? WHERE id = ? AND stock >= ?',
-          [item.quantity, item.quantity, item.id, item.quantity],
-        );
-        if (Number(sold.changes) === 0)
-          throw bad(`Stock insuffisant pour « ${item.title} »`);
-      }
-      run('DELETE FROM cart_items WHERE user_id = ?', [req.userId]);
+  wrap((_req, res) => {
+    // Do not create a paid order or mutate inventory until a provider confirms payment.
+    // Keep the endpoint stable while checkout is unavailable.
+    res.status(503).json({
+      error: 'Paiement indisponible : aucun fournisseur de paiement vérifié n’est configuré.',
+      code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
     });
-
-    res.status(201).json({ id: orderId, total });
   }),
 );
 
