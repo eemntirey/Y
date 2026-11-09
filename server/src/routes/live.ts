@@ -180,12 +180,13 @@ liveRouter.post(
     );
     if (!gift) throw notFound('Cadeau introuvable');
 
-    const balance = get<{ coin_balance: number }>('SELECT coin_balance FROM users WHERE id = ?', [req.userId])?.coin_balance ?? 0;
-    if (balance < gift.coins) throw bad('Solde de Y Coins insuffisant');
-
     const id = uid();
     tx(() => {
-      run('UPDATE users SET coin_balance = coin_balance - ? WHERE id = ?', [gift.coins, req.userId]);
+      const debit = run(
+        'UPDATE users SET coin_balance = coin_balance - ? WHERE id = ? AND coin_balance >= ?',
+        [gift.coins, req.userId, gift.coins],
+      );
+      if (Number(debit.changes) !== 1) throw bad('Solde de Y Coins insuffisant');
       run('INSERT INTO live_messages (id, room_id, user_id, kind, body, gift_id, coins, created_at) VALUES (?,?,?,?,?,?,?,?)', [
         id,
         row.id,
@@ -214,11 +215,11 @@ liveRouter.post(
 liveRouter.post(
   '/wallet/topup',
   requireAuth,
-  wrap((req: AuthedRequest, res) => {
-    const amount = Math.floor(Math.min(Math.max(Number(req.body?.amount ?? 0), 0), 100000));
-    if (!Number.isFinite(amount) || amount <= 0) throw bad('Montant invalide');
-    const coins = get<{ coin_balance: number }>('SELECT coin_balance FROM users WHERE id = ?', [req.userId])!.coin_balance;
-    run('UPDATE users SET coin_balance = coin_balance + ? WHERE id = ?', [amount, req.userId]);
-    res.json({ coins: coins + amount });
+  wrap((_req, res) => {
+    // Never credit virtual currency without a verified payment-provider event.
+    res.status(503).json({
+      error: 'Recharge indisponible : aucun fournisseur de paiement vérifié n’est configuré.',
+      code: 'PAYMENT_PROVIDER_NOT_CONFIGURED',
+    });
   }),
 );
