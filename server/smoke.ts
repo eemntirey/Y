@@ -103,6 +103,8 @@ const main = async () => {
 
     const health = await api('/health');
     check('GET /health', health.body?.ok === true && health.body?.brand === 'Y');
+    const readiness = await api('/ready');
+    check('GET /ready vérifie SQLite', readiness.status === 200 && readiness.body?.checks?.database === 'ready');
 
     const bad = await api('/auth/register', { method: 'POST', body: JSON.stringify({ username: 'A', email: 'x', password: '1' }) });
     check('validation inscription (400)', bad.status === 400, bad.body?.error);
@@ -342,10 +344,23 @@ const main = async () => {
     check('refresh token inutilisable après logout (401)', replayRefresh.status === 401);
   }
 
+  let shutdownClean = false;
+  if (server && server.exitCode === null) {
+    const exited = new Promise<boolean>((resolve) => {
+      server!.once('exit', (code) => resolve(code === 0));
+    });
+    server.kill('SIGTERM');
+    shutdownClean = await Promise.race([
+      exited,
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 3000)),
+    ]);
+  } else {
+    shutdownClean = server?.exitCode === 0;
+  }
+  check('arrêt propre sur SIGTERM', shutdownClean);
+
   console.log(`\n${failures === 0 ? 'TOUT PASSE' : `${failures} ECHEC(S)`}`);
   if (failures > 0 && serverLog) console.log('\n--- log serveur ---\n' + serverLog);
-  server?.kill();
-  await new Promise((r) => setTimeout(r, 400));
   try {
     rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   } catch {
