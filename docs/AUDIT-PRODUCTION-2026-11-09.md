@@ -79,3 +79,29 @@ Audit branch: audit/production-hardening
 ## Safety constraints
 
 No existing data was modified. No feature was removed during this audit. No migration, deployment, payment, test, build or CI result is claimed.
+
+
+## Remediation progress on `audit/production-hardening`
+
+The following initial findings now have code changes in this branch (not yet runtime-verified):
+
+- Wallet top-up is rejected with HTTP 503 until a verified payment provider exists.
+- Shop checkout is rejected with HTTP 503 until a verified payment provider exists; it no longer creates paid orders or decrements stock.
+- Gift debits use a conditional SQL update inside a transaction, preventing the balance pre-check race from creating a negative balance.
+- Access JWTs carry a session identifier and are checked against the persisted session. Refresh rotation consumes the previous refresh token and creates the replacement atomically. Logout and password changes revoke prior access tokens by deleting their sessions.
+- Production JWT secret validation rejects missing, short and trivial values.
+- Registration and refresh now have per-process IP limits in addition to login; a global per-process request ceiling is mounted.
+- WebSocket authentication moved from a query-string token to the first message frame. Subscriptions are limited to live rooms or conversations where the user is a member; event volume and frame size are capped.
+- HTTP security headers, production-only HSTS, restricted localhost CORS exception and a URL-encoded body limit were added.
+- Video uploads now check a small set of recognized file signatures after Multer writes the file.
+- Smoke assertions were updated for disabled unverified payments, refresh/logout revocation, WebSocket authorization and invalid upload signatures.
+
+### Remaining limitations
+
+- No payment provider is configured; wallet funding and shop checkout intentionally remain unavailable.
+- No immutable financial ledger, idempotency-key model, refund/reconciliation process or verified provider webhook exists yet.
+- Rate limiting is still process-local and is not safe as a shared multi-instance quota.
+- Video signature validation is not a substitute for ffprobe-based duration/codec validation or quarantine scanning.
+- The SQLite driver remains synchronous; serializer N+1 work is not yet optimized.
+- Versioned migrations, backup/restore automation, readiness, graceful shutdown, distributed WebSocket pub/sub and comprehensive integration/E2E coverage remain outstanding.
+- No build, typecheck or smoke test has been run in this environment. GitHub has not reported a workflow run or status check for the branch HEAD; CI remains unverified.
