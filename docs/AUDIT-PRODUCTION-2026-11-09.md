@@ -94,7 +94,7 @@ The following initial findings now have code changes in this branch (not yet run
 - WebSocket authentication moved from a query-string token to the first message frame. Subscriptions are limited to live rooms or conversations where the user is a member; event volume and frame size are capped.
 - HTTP security headers, production-only HSTS, restricted localhost CORS exception and a URL-encoded body limit were added.
 - Video uploads now check a small set of recognized file signatures after Multer writes the file.
-- Smoke assertions were updated for disabled unverified payments, refresh/logout revocation, WebSocket authorization and invalid upload signatures.
+- Smoke assertions were updated for disabled unverified payments, refresh/logout revocation, WebSocket authorization, invalid upload signatures, DB readiness and SIGTERM shutdown.
 
 ### Remaining limitations
 
@@ -103,5 +103,14 @@ The following initial findings now have code changes in this branch (not yet run
 - Rate limiting is still process-local and is not safe as a shared multi-instance quota.
 - Video signature validation is not a substitute for ffprobe-based duration/codec validation or quarantine scanning.
 - The SQLite driver remains synchronous; serializer N+1 work is not yet optimized.
-- Versioned migrations, backup/restore automation, readiness, graceful shutdown, distributed WebSocket pub/sub and comprehensive integration/E2E coverage remain outstanding.
-- No build, typecheck or smoke test has been run in this environment. GitHub has not reported a workflow run or status check for the branch HEAD; CI remains unverified.
+- Versioned migrations, backup/restore automation, distributed WebSocket pub/sub and comprehensive integration/E2E coverage remain outstanding.
+- No local build/test command was run from this assistant session. GitHub Actions did execute the workflow on Node.js 22.
+- First CI attempt on SHA `3d4e46907876dc12bffb959caf4852455525b900` failed because the smoke harness started the API before the seed process had released SQLite (`database is locked`). The harness was corrected to seed first and start the server afterward.
+- Latest verified SHA at this report revision: `d47f4e1b1701ac1a354cee88dfb679d64110830f`. Both push run `42628366648` and pull-request run `42628375309` completed successfully: typecheck, build and smoke all passed.
+
+
+## Operational corrections added after the initial audit
+
+- `GET /ready` and `GET /api/ready` now execute `SELECT 1` and return HTTP 503 if SQLite is unavailable.
+- SIGTERM/SIGINT handlers close WebSocket clients, stop the HTTP server and close the SQLite database, with a 10-second forced-shutdown fallback.
+- Smoke coverage now asserts DB-backed readiness and clean SIGTERM exit.
