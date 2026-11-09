@@ -84,8 +84,8 @@ const main = async () => {
       body: JSON.stringify({ username: `smoke${Date.now() % 100000}`, email, password: 'yolove2026', displayName: 'Test' }),
     });
     check('POST /auth/register (201)', reg.status === 201 && !!reg.body.token, reg.body?.error);
-    const token = reg.body.token;
-    const refresh = reg.body.refresh;
+    let token = reg.body.token;
+    let refresh = reg.body.refresh;
     const me = reg.body.user;
 
     const dup = await api('/auth/register', { method: 'POST', body: JSON.stringify({ username: me.username, email, password: 'yolove2026' }) });
@@ -112,6 +112,14 @@ const main = async () => {
 
     const refreshed = await api('/auth/refresh', { method: 'POST', body: JSON.stringify({ refresh }) });
     check('POST /auth/refresh', refreshed.status === 200 && !!refreshed.body.token);
+    if (refreshed.status === 200) {
+      token = refreshed.body.token;
+      refresh = refreshed.body.refresh;
+    }
+    const oldAccess = await api('/auth/me', { token: reg.body.token });
+    check('ancien access token révoqué après rotation (401)', oldAccess.status === 401);
+    const oldRefresh = await api('/auth/refresh', { method: 'POST', body: JSON.stringify({ refresh: reg.body.refresh }) });
+    check('ancien refresh token inutilisable après rotation (401)', oldRefresh.status === 401);
 
     const profile = await api(`/auth/me`, { token });
     check('GET /auth/me', profile.body?.user?.id === me.id);
@@ -260,6 +268,13 @@ const main = async () => {
 
     const notFound = await api('/route/inexistante');
     check('404 JSON', notFound.status === 404 && notFound.body?.error === 'Route inconnue');
+
+    const logout = await api('/auth/logout', { method: 'POST', body: JSON.stringify({ refresh }) });
+    check('POST /auth/logout', logout.status === 200);
+    const revokedAccess = await api('/auth/me', { token });
+    check('access token révoqué après logout (401)', revokedAccess.status === 401);
+    const replayRefresh = await api('/auth/refresh', { method: 'POST', body: JSON.stringify({ refresh }) });
+    check('refresh token inutilisable après logout (401)', replayRefresh.status === 401);
   }
 
   console.log(`\n${failures === 0 ? 'TOUT PASSE' : `${failures} ECHEC(S)`}`);
