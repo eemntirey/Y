@@ -26,7 +26,7 @@ const upload = multer({
   limits: { fileSize: config.maxUploadMb * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (file.mimetype.startsWith('video/')) return cb(null, true);
-    cb(new Error('Seules les vidéos sont acceptées'));
+    cb(null, false);
   },
 });
 
