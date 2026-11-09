@@ -1,5 +1,6 @@
 // Smoke test API : démarre le serveur, exerce les routes, l'arrête.
 import { spawn, spawnSync } from 'node:child_process';
+import WebSocket from 'ws';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -38,6 +39,31 @@ const api = async (path: string, init: RequestInit & { token?: string } = {}) =>
   }
   return { status: res.status, body: json };
 };
+
+const waitForWsMessage = (
+  socket: WebSocket,
+  predicate: (payload: any) => boolean,
+  timeoutMs = 3000,
+): Promise<any | null> =>
+  new Promise((resolve) => {
+    const onMessage = (raw: WebSocket.RawData) => {
+      try {
+        const payload = JSON.parse(raw.toString());
+        if (predicate(payload)) {
+          clearTimeout(timer);
+          socket.off('message', onMessage);
+          resolve(payload);
+        }
+      } catch {
+        // Ignore malformed frames in the smoke helper.
+      }
+    };
+    const timer = setTimeout(() => {
+      socket.off('message', onMessage);
+      resolve(null);
+    }, timeoutMs);
+    socket.on('message', onMessage);
+  });
 
 const waitForServer = async () => {
   for (let i = 0; i < 60; i++) {
@@ -223,6 +249,33 @@ const main = async () => {
     check('GET /live/gifts', Array.isArray(gifts.body?.items) && gifts.body.items.length > 0);
     const joined = await api(`/live/rooms/${roomId}/join`, { method: 'POST', token });
     check('POST live join (spectateur)', joined.body?.room?.stats?.viewers >= 1);
+
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
+    const readyPromise = waitForWsMessage(ws, (payload) => payload.type === 'ready');
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', () => {
+        ws.send(JSON.stringify({ type: 'auth', token }));
+        resolve();
+      });
+      ws.once('error', reject);
+    });
+    const wsReady = await readyPromise;
+    check('WebSocket authentifié par première trame (sans token URL)', !!wsReady);
+    if (wsReady) {
+      const deniedPromise = waitForWsMessage(ws, (payload) => payload.code === 'ROOM_ACCESS_DENIED');
+      ws.send(JSON.stringify({ type: 'subscribe', roomId: 'room-not-authorized' }));
+      const denied = await deniedPromise;
+      check('WebSocket refuse un salon non autorisé', !!denied);
+
+      const subscribedPromise = waitForWsMessage(
+        ws,
+        (payload) => payload.type === 'subscribed' && payload.roomId === roomId,
+      );
+      ws.send(JSON.stringify({ type: 'subscribe', roomId }));
+      const subscribed = await subscribedPromise;
+      check('WebSocket autorise un live existant', !!subscribed);
+    }
+    ws.close();
     const liveMsg = await api(`/live/rooms/${roomId}/comments`, { method: 'POST', token, body: JSON.stringify({ body: 'Salut le live' }) });
     check('POST live comment', liveMsg.status === 201);
     const walletBefore = await api('/auth/me', { token });
@@ -265,6 +318,15 @@ const main = async () => {
 
     const badUpload = await api('/videos', { method: 'POST', token, body: JSON.stringify({ description: 'sans fichier' }) });
     check('upload sans fichier refuse (400)', badUpload.status === 400);
+
+    const fakeVideo = new FormData();
+    fakeVideo.append('video', new Blob(['not a real video'], { type: 'video/mp4' }), 'fake.mp4');
+    const fakeVideoResponse = await fetch(`${BASE}/videos`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: fakeVideo,
+    });
+    check('signature vidéo falsifiée refusée (415)', fakeVideoResponse.status === 415);
 
     const notFound = await api('/route/inexistante');
     check('404 JSON', notFound.status === 404 && notFound.body?.error === 'Route inconnue');
