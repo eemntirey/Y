@@ -15,10 +15,15 @@ import { loadUserByUsername, serializeUser } from '../lib/serialize.js';
 
 export const authRouter = Router();
 
+const registerLimiter = rateLimit({ windowMs: 60_000, max: 5 });
+const loginLimiter = rateLimit({ windowMs: 60_000, max: 10 });
+const refreshLimiter = rateLimit({ windowMs: 60_000, max: 30 });
+
 const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
 authRouter.post(
   '/register',
+  registerLimiter,
   wrap(async (req, res) => {
     const username = str(req.body?.username, 24).toLowerCase();
     const email = str(req.body?.email, 160).toLowerCase();
@@ -62,9 +67,7 @@ authRouter.post(
   }),
 );
 
-// Anti brute-force : 10 tentatives / minute par IP.
-const loginLimiter = rateLimit({ windowMs: 60_000, max: 10 });
-
+// Anti brute-force : limites IP locales en attendant un backend partagé multi-instance.
 authRouter.post(
   '/login',
   loginLimiter,
@@ -89,6 +92,7 @@ authRouter.post(
 
 authRouter.post(
   '/refresh',
+  refreshLimiter,
   wrap(async (req, res) => {
     const refresh = String(req.body?.refresh ?? '');
     const session = refresh ? rotateSession(refresh, req.get('user-agent') ?? undefined) : null;
